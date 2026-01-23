@@ -189,27 +189,28 @@ def format_segments(segments):
 #     shutil.copy(uploaded_file, cleaned_path)
 #     return cleaned_path
 
-
+whisper_model=None
 
 def load_whisper_model(model_name="deepdml/faster-whisper-large-v3-turbo-ct2"):
-  whisper_model=None
-  device = "cuda" if torch.cuda.is_available() else "cpu"
-  compute_type = "float16" if torch.cuda.is_available() else "int8"
-  try:
-    whisper_model = WhisperModel(
-                    model_name,
-                    device=device,
-                    compute_type=compute_type,
-                )
-  except Exception as e:
-    model_dir = download_model(
-                "deepdml/faster-whisper-large-v3-turbo-ct2",
-                download_folder="./",
-                redownload=False)
-    whisper_model = WhisperModel(
-                model_dir,
-                device=device,
-                compute_type=compute_type)
+  global whisper_model
+  if whisper_model is None:
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    compute_type = "float16" if torch.cuda.is_available() else "int8"
+    try:
+      whisper_model = WhisperModel(
+                      model_name,
+                      device=device,
+                      compute_type=compute_type,
+                  )
+    except Exception as e:
+      model_dir = download_model(
+                  "deepdml/faster-whisper-large-v3-turbo-ct2",
+                  download_folder="./",
+                  redownload=False)
+      whisper_model = WhisperModel(
+                  model_dir,
+                  device=device,
+                  compute_type=compute_type)
   return whisper_model
 
 
