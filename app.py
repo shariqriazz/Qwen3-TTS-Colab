@@ -494,7 +494,7 @@ def build_ui():
                 gr.HTML("""
                 <hr>
                 <p style="color: red; font-weight: bold; font-size: 16px;">
-                NOTE
+                ⚠️ NOTE
                 </p>
                 <p>
                 This Gradio UI is not affiliated with the official Qwen3-TTS project and is based on the
