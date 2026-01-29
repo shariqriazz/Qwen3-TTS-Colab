@@ -1,9 +1,15 @@
 # %cd /content/Qwen3-TTS-Colab
+import os
+
+# Reduce noisy TF/XLA logs in Colab (cosmetic).
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("GLOG_minloglevel", "2")
+os.environ.setdefault("ABSL_MIN_LOG_LEVEL", "2")
+
 from subtitle import subtitle_maker
 from process_text import text_chunk
 from qwen_tts import Qwen3TTSModel
 import subprocess
-import os
 import gradio as gr
 import numpy as np
 import torch
