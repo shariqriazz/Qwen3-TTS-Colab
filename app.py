@@ -24,7 +24,7 @@ else:
 
 # Global model holders
 loaded_models = {}
-MODEL_SIZES = ["0.6B", "1.7B"]
+MODEL_SIZES = ["1.7B"]
 
 # Speaker and language choices
 SPEAKERS = [
@@ -38,14 +38,15 @@ AVAILABLE_MODELS = {
         "description": "Create custom voices using natural language descriptions",
     },
     "Base": {
-        "sizes": ["0.6B", "1.7B"],
+        "sizes": ["1.7B"],
         "description": "Voice cloning from reference audio",
     },
     "CustomVoice": {
-        "sizes": ["0.6B", "1.7B"],
+        "sizes": ["1.7B"],
         "description": "TTS with predefined speakers and style instructions",
     },
 }
+
 
 # --- Helper Functions ---
 
@@ -76,6 +77,15 @@ def get_model_path(model_type: str, model_size: str) -> str:
       return snapshot_download(f"Qwen/Qwen3-TTS-12Hz-{model_size}-{model_type}")
     except Exception as e:
       return download_model(f"Qwen/Qwen3-TTS-12Hz-{model_size}-{model_type}", download_folder="./qwen_tts_model", redownload= False)
+
+# Auto-download all available models on startup (set QWEN3_TTS_SKIP_AUTO_DOWNLOAD=1 to skip)
+if os.getenv("QWEN3_TTS_SKIP_AUTO_DOWNLOAD") != "1":
+    for _mtype, _info in AVAILABLE_MODELS.items():
+        for _msize in _info.get("sizes", []):
+            try:
+                _ = get_model_path(_mtype, _msize)
+            except Exception as e:
+                print(f"Auto-download failed for {_mtype} {_msize}: {e}")
 
 def get_available_sizes(model_type: str):
     sizes = AVAILABLE_MODELS.get(model_type, {}).get("sizes", [])
@@ -313,7 +323,7 @@ def stitch_chunk_files(chunk_files, output_filename, gap_seconds=0.0):
 # --- Generators (Memory Optimized) ---
 
 def generate_voice_design(text, language, voice_description, remove_silence, make_subs, seed, chunk_size, chunk_gap, consistent_voice, base_model_size):
-    if not text or not text.strip(): return None, "Error: Text is required.", None, None, None, None, seed
+    if not text or not text.strip(): return None, "Error: Text is required.", None, None, None, None, seed, None
     
     try:
         seed = resolve_seed(seed)
@@ -393,13 +403,13 @@ def generate_voice_design(text, language, voice_description, remove_silence, mak
         final_audio, srt1, srt2, srt3, srt4 = process_audio_output(stitched_file, make_subs, remove_silence, language)
         
         status = f"Generation Success! Seed: {seed} | Mode: {mode_label}"
-        return final_audio, status, srt1, srt2, srt3, srt4, seed
+        return final_audio, status, srt1, srt2, srt3, srt4, seed, final_audio
 
     except Exception as e:
-        return None, f"Error: {e}", None, None, None, None, seed if 'seed' in locals() else -1
+        return None, f"Error: {e}", None, None, None, None, seed if 'seed' in locals() else -1, None
 
 def generate_custom_voice(text, language, speaker, instruct, model_size, remove_silence, make_subs, seed, chunk_size, chunk_gap):
-    if not text or not text.strip(): return None, "Error: Text is required.", None, None, None, None, seed
+    if not text or not text.strip(): return None, "Error: Text is required.", None, None, None, None, seed, None
     
     try:
         seed = resolve_seed(seed)
@@ -431,14 +441,14 @@ def generate_custom_voice(text, language, speaker, instruct, model_size, remove_
         stitched_file = stitch_chunk_files(chunk_files, tts_filename, gap_seconds=chunk_gap)
         final_audio, srt1, srt2, srt3, srt4 = process_audio_output(stitched_file, make_subs, remove_silence, language)
         status = f"Generation Success! Seed: {seed}"
-        return final_audio, status, srt1, srt2, srt3, srt4, seed
+        return final_audio, status, srt1, srt2, srt3, srt4, seed, final_audio
 
     except Exception as e:
-        return None, f"Error: {e}", None, None, None, None, seed if 'seed' in locals() else -1
+        return None, f"Error: {e}", None, None, None, None, seed if 'seed' in locals() else -1, None
 
 def smart_generate_clone(ref_audio, ref_text, target_text, language, mode, model_size, remove_silence, make_subs, seed, chunk_size, chunk_gap):
-    if not target_text or not target_text.strip(): return None, "Error: Target text is required.", None, None, None, None, seed
-    if not ref_audio: return None, "Error: Ref audio required.", None, None, None, None, seed
+    if not target_text or not target_text.strip(): return None, "Error: Target text is required.", None, None, None, None, seed, None
+    if not ref_audio: return None, "Error: Ref audio required.", None, None, None, None, seed, None
 
     # 1. Mode & Transcript Logic
     use_xvector_only = ("Fast" in mode)
@@ -451,9 +461,9 @@ def smart_generate_clone(ref_audio, ref_text, target_text, language, mode, model
             try:
                 final_ref_text = transcribe_reference(ref_audio, True, language)
                 if not final_ref_text or "Error" in final_ref_text:
-                     return None, f"Transcription failed: {final_ref_text}", None, None, None, None, seed
+                     return None, f"Transcription failed: {final_ref_text}", None, None, None, None, seed, None
             except Exception as e:
-                return None, f"Transcribe Error: {e}", None, None, None, None, seed
+                return None, f"Transcribe Error: {e}", None, None, None, None, seed, None
     else:
         final_ref_text = None
 
@@ -489,10 +499,10 @@ def smart_generate_clone(ref_audio, ref_text, target_text, language, mode, model
         stitched_file = stitch_chunk_files(chunk_files, tts_filename, gap_seconds=chunk_gap)
         final_audio, srt1, srt2, srt3, srt4 = process_audio_output(stitched_file, make_subs, remove_silence, language)
         status = f"Success! Mode: {mode} | Seed: {seed}"
-        return final_audio, status, srt1, srt2, srt3, srt4, seed
+        return final_audio, status, srt1, srt2, srt3, srt4, seed, final_audio
 
     except Exception as e:
-        return None, f"Error: {e}", None, None, None, None, seed if 'seed' in locals() else -1
+        return None, f"Error: {e}", None, None, None, None, seed if 'seed' in locals() else -1, None
 
 
 # --- UI Construction ---
@@ -528,7 +538,7 @@ def build_ui():
                                 )
                                 download_model_size = gr.Dropdown(
                                     label="Size",
-                                    choices=["0.6B", "1.7B"],
+                                    choices=MODEL_SIZES,
                                     value="1.7B",
                                     interactive=True,
                                     scale=1,
@@ -563,7 +573,7 @@ def build_ui():
                                 )
                                 load_model_size = gr.Dropdown(
                                     label="Size",
-                                    choices=["0.6B", "1.7B"],
+                                    choices=MODEL_SIZES,
                                     value="1.7B",
                                     interactive=True,
                                     scale=1,
@@ -626,6 +636,7 @@ def build_ui():
                     with gr.Column(scale=2):
                         design_audio_out = gr.Audio(label="Generated Audio", type="filepath")
                         design_status = gr.Textbox(label="Status", interactive=False)
+                        design_audio_file = gr.File(label="Download Audio")
                         
                         with gr.Accordion("📝 Subtitles", open=False):
                             with gr.Row():
@@ -638,7 +649,7 @@ def build_ui():
                 design_btn.click(
                     generate_voice_design, 
                     inputs=[design_text, design_language, design_instruct, design_rem_silence, design_make_subs, design_seed, design_chunk_size, design_chunk_gap, design_consistent, design_base_size], 
-                    outputs=[design_audio_out, design_status, d_srt1, d_srt2, d_srt3, d_srt4, design_seed]
+                    outputs=[design_audio_out, design_status, d_srt1, d_srt2, d_srt3, d_srt4, design_seed, design_audio_file]
                 )
 
             # --- Tab 2: Voice Clone ---
@@ -675,6 +686,7 @@ def build_ui():
                     with gr.Column(scale=2):
                         clone_audio_out = gr.Audio(label="Generated Audio", type="filepath")
                         clone_status = gr.Textbox(label="Status", interactive=False)
+                        clone_audio_file = gr.File(label="Download Audio")
                         
                         with gr.Accordion("📝 Subtitles", open=False):
                             with gr.Row():
@@ -690,7 +702,7 @@ def build_ui():
                 clone_btn.click(
                     smart_generate_clone,
                     inputs=[clone_ref_audio, clone_ref_text, clone_target_text, clone_language, clone_mode, clone_model_size, clone_rem_silence, clone_make_subs, clone_seed, clone_chunk_size, clone_chunk_gap],
-                    outputs=[clone_audio_out, clone_status, c_srt1, c_srt2, c_srt3, c_srt4, clone_seed]
+                    outputs=[clone_audio_out, clone_status, c_srt1, c_srt2, c_srt3, c_srt4, clone_seed, clone_audio_file]
                 )
 
             # --- Tab 3: TTS (CustomVoice) ---
@@ -720,6 +732,7 @@ def build_ui():
                     with gr.Column(scale=2):
                         tts_audio_out = gr.Audio(label="Generated Audio", type="filepath")
                         tts_status = gr.Textbox(label="Status", interactive=False)
+                        tts_audio_file = gr.File(label="Download Audio")
                         
                         with gr.Accordion("📝 Subtitles", open=False):
                             with gr.Row():
@@ -732,7 +745,7 @@ def build_ui():
                 tts_btn.click(
                     generate_custom_voice, 
                     inputs=[tts_text, tts_language, tts_speaker, tts_instruct, tts_model_size, tts_rem_silence, tts_make_subs, tts_seed, tts_chunk_size, tts_chunk_gap], 
-                    outputs=[tts_audio_out, tts_status, t_srt1, t_srt2, t_srt3, t_srt4, tts_seed]
+                    outputs=[tts_audio_out, tts_status, t_srt1, t_srt2, t_srt3, t_srt4, tts_seed, tts_audio_file]
                 )
             # --- Tab 4: About ---
             with gr.Tab("About"):
