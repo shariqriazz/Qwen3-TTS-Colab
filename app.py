@@ -9,6 +9,11 @@ import numpy as np
 import torch
 import soundfile as sf
 import random
+import json
+import shutil
+import zipfile
+from datetime import datetime
+from uuid import uuid4
 from pydub import AudioSegment
 from pydub.silence import split_on_silence
 from huggingface_hub import snapshot_download, scan_cache_dir
@@ -320,6 +325,62 @@ def stitch_chunk_files(chunk_files, output_filename, gap_seconds=0.0):
             
     return output_filename
 
+def _write_text(path: str, content: str):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content or "")
+
+def create_bundle(bundle_prefix: str, audio_path: str, meta: dict, subtitle_paths: list, extra_paths: list = None):
+    """Create a zip bundle with audio, metadata, text, prompt, and subtitles."""
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_prefix = "".join(c if c.isalnum() or c in ("_", "-") else "_" for c in (bundle_prefix or "bundle"))
+    bundle_dir = os.path.join("./ai_tts_voice", f"bundle_{safe_prefix}_{ts}_{uuid4().hex[:8]}")
+    os.makedirs(bundle_dir, exist_ok=True)
+
+    # Save metadata
+    manifest_path = os.path.join(bundle_dir, "manifest.json")
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False)
+
+    # Optional readable files
+    if meta.get("text"):
+        _write_text(os.path.join(bundle_dir, "text.txt"), meta.get("text", ""))
+    if meta.get("prompt"):
+        _write_text(os.path.join(bundle_dir, "prompt.txt"), meta.get("prompt", ""))
+    if meta.get("reference_text"):
+        _write_text(os.path.join(bundle_dir, "reference_text.txt"), meta.get("reference_text", ""))
+
+    # Copy audio
+    if audio_path and os.path.exists(audio_path):
+        ext = os.path.splitext(audio_path)[1] or ".wav"
+        shutil.copy2(audio_path, os.path.join(bundle_dir, f"audio{ext}"))
+
+    # Copy subtitles
+    if subtitle_paths:
+        subs_dir = os.path.join(bundle_dir, "subtitles")
+        os.makedirs(subs_dir, exist_ok=True)
+        for p in subtitle_paths:
+            if p and os.path.exists(p):
+                shutil.copy2(p, os.path.join(subs_dir, os.path.basename(p)))
+
+    # Extra files (e.g., reference audio)
+    if extra_paths:
+        extra_dir = os.path.join(bundle_dir, "extras")
+        os.makedirs(extra_dir, exist_ok=True)
+        for p in extra_paths:
+            if p and os.path.exists(p):
+                shutil.copy2(p, os.path.join(extra_dir, os.path.basename(p)))
+
+    # Zip it
+    zip_path = f"{bundle_dir}.zip"
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for root, _, files in os.walk(bundle_dir):
+            for file in files:
+                full_path = os.path.join(root, file)
+                rel_path = os.path.relpath(full_path, bundle_dir)
+                zf.write(full_path, rel_path)
+
+    return zip_path
+
 # --- Generators (Memory Optimized) ---
 
 def generate_voice_design(text, language, voice_description, remove_silence, make_subs, seed, chunk_size, chunk_gap, consistent_voice, base_model_size):
@@ -401,12 +462,30 @@ def generate_voice_design(text, language, voice_description, remove_silence, mak
         
         # 4. Post-Process
         final_audio, srt1, srt2, srt3, srt4 = process_audio_output(stitched_file, make_subs, remove_silence, language)
+        bundle_meta = {
+            "mode": "VoiceDesign",
+            "consistent_voice": bool(consistent_voice),
+            "base_model_size": base_model_size,
+            "model_used": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign" if not consistent_voice else f"Qwen/Qwen3-TTS-12Hz-{base_model_size}-Base",
+            "language": language,
+            "seed": seed,
+            "chunk_size": int(chunk_size),
+            "chunk_gap": float(chunk_gap),
+            "text": text.strip(),
+            "prompt": voice_description.strip(),
+        }
+        bundle_path = create_bundle(
+            "voice_design",
+            final_audio,
+            bundle_meta,
+            [srt1, srt2, srt3, srt4],
+        )
         
         status = f"Generation Success! Seed: {seed} | Mode: {mode_label}"
-        return final_audio, status, srt1, srt2, srt3, srt4, seed, final_audio
+        return final_audio, status, srt1, srt2, srt3, srt4, seed, final_audio, bundle_path
 
     except Exception as e:
-        return None, f"Error: {e}", None, None, None, None, seed if 'seed' in locals() else -1, None
+        return None, f"Error: {e}", None, None, None, None, seed if 'seed' in locals() else -1, None, None
 
 def generate_custom_voice(text, language, speaker, instruct, model_size, remove_silence, make_subs, seed, chunk_size, chunk_gap):
     if not text or not text.strip(): return None, "Error: Text is required.", None, None, None, None, seed, None
@@ -440,11 +519,28 @@ def generate_custom_voice(text, language, speaker, instruct, model_size, remove_
             
         stitched_file = stitch_chunk_files(chunk_files, tts_filename, gap_seconds=chunk_gap)
         final_audio, srt1, srt2, srt3, srt4 = process_audio_output(stitched_file, make_subs, remove_silence, language)
+        bundle_meta = {
+            "mode": "CustomVoice",
+            "model_used": f"Qwen/Qwen3-TTS-12Hz-{model_size}-CustomVoice",
+            "language": language,
+            "speaker": speaker,
+            "seed": seed,
+            "chunk_size": int(chunk_size),
+            "chunk_gap": float(chunk_gap),
+            "text": text.strip(),
+            "prompt": (instruct or "").strip(),
+        }
+        bundle_path = create_bundle(
+            "custom_voice",
+            final_audio,
+            bundle_meta,
+            [srt1, srt2, srt3, srt4],
+        )
         status = f"Generation Success! Seed: {seed}"
-        return final_audio, status, srt1, srt2, srt3, srt4, seed, final_audio
+        return final_audio, status, srt1, srt2, srt3, srt4, seed, final_audio, bundle_path
 
     except Exception as e:
-        return None, f"Error: {e}", None, None, None, None, seed if 'seed' in locals() else -1, None
+        return None, f"Error: {e}", None, None, None, None, seed if 'seed' in locals() else -1, None, None
 
 def smart_generate_clone(ref_audio, ref_text, target_text, language, mode, model_size, remove_silence, make_subs, seed, chunk_size, chunk_gap):
     if not target_text or not target_text.strip(): return None, "Error: Target text is required.", None, None, None, None, seed, None
@@ -498,11 +594,30 @@ def smart_generate_clone(ref_audio, ref_text, target_text, language, mode, model
         # 4. Stitch & Process
         stitched_file = stitch_chunk_files(chunk_files, tts_filename, gap_seconds=chunk_gap)
         final_audio, srt1, srt2, srt3, srt4 = process_audio_output(stitched_file, make_subs, remove_silence, language)
+        bundle_meta = {
+            "mode": "VoiceClone",
+            "model_used": f"Qwen/Qwen3-TTS-12Hz-{model_size}-Base",
+            "language": language,
+            "seed": seed,
+            "chunk_size": int(chunk_size),
+            "chunk_gap": float(chunk_gap),
+            "text": target_text.strip(),
+            "reference_text": final_ref_text.strip() if final_ref_text else None,
+            "x_vector_only_mode": bool(use_xvector_only),
+        }
+        extra_files = [ref_audio] if isinstance(ref_audio, str) else []
+        bundle_path = create_bundle(
+            "voice_clone",
+            final_audio,
+            bundle_meta,
+            [srt1, srt2, srt3, srt4],
+            extra_paths=extra_files,
+        )
         status = f"Success! Mode: {mode} | Seed: {seed}"
-        return final_audio, status, srt1, srt2, srt3, srt4, seed, final_audio
+        return final_audio, status, srt1, srt2, srt3, srt4, seed, final_audio, bundle_path
 
     except Exception as e:
-        return None, f"Error: {e}", None, None, None, None, seed if 'seed' in locals() else -1, None
+        return None, f"Error: {e}", None, None, None, None, seed if 'seed' in locals() else -1, None, None
 
 
 # --- UI Construction ---
@@ -637,6 +752,7 @@ def build_ui():
                         design_audio_out = gr.Audio(label="Generated Audio", type="filepath")
                         design_status = gr.Textbox(label="Status", interactive=False)
                         design_audio_file = gr.File(label="Download Audio")
+                        design_bundle_file = gr.File(label="Download Bundle (ZIP)")
                         
                         with gr.Accordion("📝 Subtitles", open=False):
                             with gr.Row():
@@ -649,7 +765,7 @@ def build_ui():
                 design_btn.click(
                     generate_voice_design, 
                     inputs=[design_text, design_language, design_instruct, design_rem_silence, design_make_subs, design_seed, design_chunk_size, design_chunk_gap, design_consistent, design_base_size], 
-                    outputs=[design_audio_out, design_status, d_srt1, d_srt2, d_srt3, d_srt4, design_seed, design_audio_file]
+                    outputs=[design_audio_out, design_status, d_srt1, d_srt2, d_srt3, d_srt4, design_seed, design_audio_file, design_bundle_file]
                 )
 
             # --- Tab 2: Voice Clone ---
@@ -687,6 +803,7 @@ def build_ui():
                         clone_audio_out = gr.Audio(label="Generated Audio", type="filepath")
                         clone_status = gr.Textbox(label="Status", interactive=False)
                         clone_audio_file = gr.File(label="Download Audio")
+                        clone_bundle_file = gr.File(label="Download Bundle (ZIP)")
                         
                         with gr.Accordion("📝 Subtitles", open=False):
                             with gr.Row():
@@ -702,7 +819,7 @@ def build_ui():
                 clone_btn.click(
                     smart_generate_clone,
                     inputs=[clone_ref_audio, clone_ref_text, clone_target_text, clone_language, clone_mode, clone_model_size, clone_rem_silence, clone_make_subs, clone_seed, clone_chunk_size, clone_chunk_gap],
-                    outputs=[clone_audio_out, clone_status, c_srt1, c_srt2, c_srt3, c_srt4, clone_seed, clone_audio_file]
+                    outputs=[clone_audio_out, clone_status, c_srt1, c_srt2, c_srt3, c_srt4, clone_seed, clone_audio_file, clone_bundle_file]
                 )
 
             # --- Tab 3: TTS (CustomVoice) ---
@@ -733,6 +850,7 @@ def build_ui():
                         tts_audio_out = gr.Audio(label="Generated Audio", type="filepath")
                         tts_status = gr.Textbox(label="Status", interactive=False)
                         tts_audio_file = gr.File(label="Download Audio")
+                        tts_bundle_file = gr.File(label="Download Bundle (ZIP)")
                         
                         with gr.Accordion("📝 Subtitles", open=False):
                             with gr.Row():
@@ -745,7 +863,7 @@ def build_ui():
                 tts_btn.click(
                     generate_custom_voice, 
                     inputs=[tts_text, tts_language, tts_speaker, tts_instruct, tts_model_size, tts_rem_silence, tts_make_subs, tts_seed, tts_chunk_size, tts_chunk_gap], 
-                    outputs=[tts_audio_out, tts_status, t_srt1, t_srt2, t_srt3, t_srt4, tts_seed, tts_audio_file]
+                    outputs=[tts_audio_out, tts_status, t_srt1, t_srt2, t_srt3, t_srt4, tts_seed, tts_audio_file, tts_bundle_file]
                 )
             # --- Tab 4: About ---
             with gr.Tab("About"):
