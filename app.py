@@ -8,9 +8,10 @@ import gradio as gr
 import numpy as np
 import torch
 import soundfile as sf
+import random
 from pydub import AudioSegment
 from pydub.silence import split_on_silence
-from huggingface_hub import snapshot_download
+from huggingface_hub import snapshot_download, scan_cache_dir
 from hf_downloader import download_model
 import gc 
 from huggingface_hub import login
@@ -31,7 +32,43 @@ SPEAKERS = [
 ]
 LANGUAGES = ["Auto", "Chinese", "English", "Japanese", "Korean", "French", "German", "Spanish", "Portuguese", "Russian"]
 
+AVAILABLE_MODELS = {
+    "VoiceDesign": {
+        "sizes": ["1.7B"],
+        "description": "Create custom voices using natural language descriptions",
+    },
+    "Base": {
+        "sizes": ["0.6B", "1.7B"],
+        "description": "Voice cloning from reference audio",
+    },
+    "CustomVoice": {
+        "sizes": ["0.6B", "1.7B"],
+        "description": "TTS with predefined speakers and style instructions",
+    },
+}
+
 # --- Helper Functions ---
+
+def set_seed(seed: int):
+    """Set random seed for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+def resolve_seed(seed):
+    """Resolve seed input; -1 or None => random seed."""
+    try:
+        seed = int(seed)
+    except Exception:
+        seed = -1
+    if seed == -1:
+        seed = random.randint(0, 2147483647)
+    return seed
 
 def get_model_path(model_type: str, model_size: str) -> str:
     """Get model path based on type and size."""
@@ -39,6 +76,70 @@ def get_model_path(model_type: str, model_size: str) -> str:
       return snapshot_download(f"Qwen/Qwen3-TTS-12Hz-{model_size}-{model_type}")
     except Exception as e:
       return download_model(f"Qwen/Qwen3-TTS-12Hz-{model_size}-{model_type}", download_folder="./qwen_tts_model", redownload= False)
+
+def get_available_sizes(model_type: str):
+    sizes = AVAILABLE_MODELS.get(model_type, {}).get("sizes", [])
+    return gr.update(choices=sizes, value=sizes[0] if sizes else None)
+
+def check_model_downloaded(model_type: str, model_size: str) -> bool:
+    repo_id = f"Qwen/Qwen3-TTS-12Hz-{model_size}-{model_type}"
+    try:
+        cache_info = scan_cache_dir()
+        for repo in cache_info.repos:
+            if repo.repo_id == repo_id:
+                return True
+    except Exception:
+        pass
+    local_dir = os.path.join("qwen_tts_model", repo_id.split("/")[-1])
+    return os.path.isdir(local_dir)
+
+def get_downloaded_models_status() -> str:
+    lines = ["### Model Download Status\n"]
+    for model_type, info in AVAILABLE_MODELS.items():
+        lines.append(f"**{model_type}** - {info['description']}")
+        for size in info["sizes"]:
+            status = "✅ Downloaded" if check_model_downloaded(model_type, size) else "⬜ Not downloaded"
+            lines.append(f"  - {size}: {status}")
+        lines.append("")
+    return "\n".join(lines)
+
+def download_model_ui(model_type: str, model_size: str):
+    if model_size not in AVAILABLE_MODELS.get(model_type, {}).get("sizes", []):
+        return f"❌ Invalid combination: {model_type} {model_size}", get_downloaded_models_status()
+    if check_model_downloaded(model_type, model_size):
+        return f"✅ {model_type} {model_size} is already downloaded!", get_downloaded_models_status()
+    try:
+        _ = get_model_path(model_type, model_size)
+        return f"✅ Successfully downloaded {model_type} {model_size}!", get_downloaded_models_status()
+    except Exception as e:
+        return f"❌ Error downloading {model_type} {model_size}: {str(e)}", get_downloaded_models_status()
+
+def get_loaded_models_status() -> str:
+    if not loaded_models:
+        return "No models currently loaded in memory."
+    lines = ["**Currently loaded models:**"]
+    for (model_type, model_size) in loaded_models.keys():
+        lines.append(f"- {model_type} ({model_size})")
+    return "\n".join(lines)
+
+def load_model_ui(model_type: str, model_size: str):
+    if model_size not in AVAILABLE_MODELS.get(model_type, {}).get("sizes", []):
+        return f"❌ Invalid combination: {model_type} {model_size}", get_loaded_models_status()
+    key = (model_type, model_size)
+    if key in loaded_models:
+        return f"✅ {model_type} {model_size} is already loaded!", get_loaded_models_status()
+    try:
+        _ = get_model(model_type, model_size)
+        return f"✅ Successfully loaded {model_type} {model_size}!", get_loaded_models_status()
+    except Exception as e:
+        return f"❌ Error loading {model_type} {model_size}: {str(e)}", get_loaded_models_status()
+
+def unload_all_models_ui():
+    if not loaded_models:
+        return "⚠️ No models are currently loaded.", get_loaded_models_status()
+    count = len(loaded_models)
+    clear_other_models(keep_key=None)
+    return f"✅ Unloaded {count} model(s).", get_loaded_models_status()
 
 def clear_other_models(keep_key=None):
     """Delete all loaded models except the current one."""
@@ -175,7 +276,7 @@ def process_audio_output(audio_path, make_subtitle, remove_silence, language="Au
 
     return final_audio_path, default_srt, custom_srt, word_srt, shorts_srt
 
-def stitch_chunk_files(chunk_files,output_filename):
+def stitch_chunk_files(chunk_files, output_filename, gap_seconds=0.0):
     """
     Takes a list of file paths.
     Stitches them into one file.
@@ -187,10 +288,12 @@ def stitch_chunk_files(chunk_files,output_filename):
     combined_audio = AudioSegment.empty()
     
     print(f"Stitching {len(chunk_files)} audio files...")
-    for f in chunk_files:
+    for i, f in enumerate(chunk_files):
         try:
             segment = AudioSegment.from_wav(f)
             combined_audio += segment
+            if gap_seconds and i < len(chunk_files) - 1:
+                combined_audio += AudioSegment.silent(duration=int(gap_seconds * 1000))
         except Exception as e:
             print(f"Error appending chunk {f}: {e}")
 
@@ -209,58 +312,104 @@ def stitch_chunk_files(chunk_files,output_filename):
 
 # --- Generators (Memory Optimized) ---
 
-def generate_voice_design(text, language, voice_description, remove_silence, make_subs):
-    if not text or not text.strip(): return None, "Error: Text is required.", None, None, None, None
+def generate_voice_design(text, language, voice_description, remove_silence, make_subs, seed, chunk_size, chunk_gap, consistent_voice, base_model_size):
+    if not text or not text.strip(): return None, "Error: Text is required.", None, None, None, None, seed
     
     try:
+        seed = resolve_seed(seed)
         # 1. Chunk Text
-        text_chunks, tts_filename = text_chunk(text, language, char_limit=280)
+        text_chunks, tts_filename = text_chunk(text, language, char_limit=int(chunk_size))
         print(f"Processing {len(text_chunks)} chunks...")
         
         chunk_files = []
-        tts = get_model("VoiceDesign", "1.7B")
+        mode_label = "VoiceDesign"
 
-        # 2. Generate & Save Loop
-        for i, chunk in enumerate(text_chunks):
-            wavs, sr = tts.generate_voice_design(
-                text=chunk.strip(),
+        if consistent_voice and len(text_chunks) > 1:
+            # Step 1: Generate a reference voice using VoiceDesign
+            tts_design = get_model("VoiceDesign", "1.7B")
+            ref_text = text_chunks[0].strip()
+            set_seed(seed)
+            ref_wavs, ref_sr = tts_design.generate_voice_design(
+                text=ref_text,
                 language=language,
                 instruct=voice_description.strip(),
                 non_streaming_mode=True,
                 max_new_tokens=2048,
             )
-            
-            # Save immediately to disk
-            temp_filename = f"temp_chunk_{i}_{os.getpid()}.wav"
-            sf.write(temp_filename, wavs[0], sr)
-            chunk_files.append(temp_filename)
-            
-            # Clear memory
-            del wavs
+            ref_audio_tuple = (ref_wavs[0], ref_sr)
+            del ref_wavs
             torch.cuda.empty_cache()
             gc.collect()
+
+            # Step 2: Clone that reference voice for all chunks
+            tts_base = get_model("Base", base_model_size)
+            for i, chunk in enumerate(text_chunks):
+                set_seed(seed)
+                wavs, sr = tts_base.generate_voice_clone(
+                    text=chunk.strip(),
+                    language=language,
+                    ref_audio=ref_audio_tuple,
+                    ref_text=ref_text,
+                    x_vector_only_mode=False,
+                    max_new_tokens=2048,
+                )
+                temp_filename = f"temp_chunk_{i}_{os.getpid()}.wav"
+                sf.write(temp_filename, wavs[0], sr)
+                chunk_files.append(temp_filename)
+
+                del wavs
+                torch.cuda.empty_cache()
+                gc.collect()
+
+            mode_label = f"Consistent Voice (VoiceDesign→Base {base_model_size})"
+        else:
+            tts = get_model("VoiceDesign", "1.7B")
+
+            # 2. Generate & Save Loop
+            for i, chunk in enumerate(text_chunks):
+                set_seed(seed)
+                wavs, sr = tts.generate_voice_design(
+                    text=chunk.strip(),
+                    language=language,
+                    instruct=voice_description.strip(),
+                    non_streaming_mode=True,
+                    max_new_tokens=2048,
+                )
+                
+                # Save immediately to disk
+                temp_filename = f"temp_chunk_{i}_{os.getpid()}.wav"
+                sf.write(temp_filename, wavs[0], sr)
+                chunk_files.append(temp_filename)
+                
+                # Clear memory
+                del wavs
+                torch.cuda.empty_cache()
+                gc.collect()
         
         # 3. Stitch from disk
-        stitched_file = stitch_chunk_files(chunk_files,tts_filename)
+        stitched_file = stitch_chunk_files(chunk_files, tts_filename, gap_seconds=chunk_gap)
         
         # 4. Post-Process
         final_audio, srt1, srt2, srt3, srt4 = process_audio_output(stitched_file, make_subs, remove_silence, language)
         
-        return final_audio, "Generation Success!", srt1, srt2, srt3, srt4
+        status = f"Generation Success! Seed: {seed} | Mode: {mode_label}"
+        return final_audio, status, srt1, srt2, srt3, srt4, seed
 
     except Exception as e:
-        return None, f"Error: {e}", None, None, None, None
+        return None, f"Error: {e}", None, None, None, None, seed if 'seed' in locals() else -1
 
-def generate_custom_voice(text, language, speaker, instruct, model_size, remove_silence, make_subs):
-    if not text or not text.strip(): return None, "Error: Text is required.", None, None, None, None
+def generate_custom_voice(text, language, speaker, instruct, model_size, remove_silence, make_subs, seed, chunk_size, chunk_gap):
+    if not text or not text.strip(): return None, "Error: Text is required.", None, None, None, None, seed
     
     try:
-        text_chunks, tts_filename = text_chunk(text, language, char_limit=280)
+        seed = resolve_seed(seed)
+        text_chunks, tts_filename = text_chunk(text, language, char_limit=int(chunk_size))
         chunk_files = []
         tts = get_model("CustomVoice", model_size)
         formatted_speaker = speaker.lower().replace(" ", "_")
 
         for i, chunk in enumerate(text_chunks):
+            set_seed(seed)
             wavs, sr = tts.generate_custom_voice(
                 text=chunk.strip(),
                 language=language,
@@ -279,16 +428,17 @@ def generate_custom_voice(text, language, speaker, instruct, model_size, remove_
             torch.cuda.empty_cache()
             gc.collect()
             
-        stitched_file = stitch_chunk_files(chunk_files,tts_filename)
+        stitched_file = stitch_chunk_files(chunk_files, tts_filename, gap_seconds=chunk_gap)
         final_audio, srt1, srt2, srt3, srt4 = process_audio_output(stitched_file, make_subs, remove_silence, language)
-        return final_audio, "Generation Success!", srt1, srt2, srt3, srt4
+        status = f"Generation Success! Seed: {seed}"
+        return final_audio, status, srt1, srt2, srt3, srt4, seed
 
     except Exception as e:
-        return None, f"Error: {e}", None, None, None, None
+        return None, f"Error: {e}", None, None, None, None, seed if 'seed' in locals() else -1
 
-def smart_generate_clone(ref_audio, ref_text, target_text, language, mode, model_size, remove_silence, make_subs):
-    if not target_text or not target_text.strip(): return None, "Error: Target text is required.", None, None, None, None
-    if not ref_audio: return None, "Error: Ref audio required.", None, None, None, None
+def smart_generate_clone(ref_audio, ref_text, target_text, language, mode, model_size, remove_silence, make_subs, seed, chunk_size, chunk_gap):
+    if not target_text or not target_text.strip(): return None, "Error: Target text is required.", None, None, None, None, seed
+    if not ref_audio: return None, "Error: Ref audio required.", None, None, None, None, seed
 
     # 1. Mode & Transcript Logic
     use_xvector_only = ("Fast" in mode)
@@ -301,20 +451,22 @@ def smart_generate_clone(ref_audio, ref_text, target_text, language, mode, model
             try:
                 final_ref_text = transcribe_reference(ref_audio, True, language)
                 if not final_ref_text or "Error" in final_ref_text:
-                     return None, f"Transcription failed: {final_ref_text}", None, None, None, None
+                     return None, f"Transcription failed: {final_ref_text}", None, None, None, None, seed
             except Exception as e:
-                return None, f"Transcribe Error: {e}", None, None, None, None
+                return None, f"Transcribe Error: {e}", None, None, None, None, seed
     else:
         final_ref_text = None
 
     try:
         # 2. Chunk Target Text
-        text_chunks, tts_filename = text_chunk(target_text, language, char_limit=280)
+        seed = resolve_seed(seed)
+        text_chunks, tts_filename = text_chunk(target_text, language, char_limit=int(chunk_size))
         chunk_files = []
         tts = get_model("Base", model_size)
 
         # 3. Generate Loop
         for i, chunk in enumerate(text_chunks):
+            set_seed(seed)
             wavs, sr = tts.generate_voice_clone(
                 text=chunk.strip(),
                 language=language,
@@ -334,12 +486,13 @@ def smart_generate_clone(ref_audio, ref_text, target_text, language, mode, model
             gc.collect()
 
         # 4. Stitch & Process
-        stitched_file = stitch_chunk_files(chunk_files,tts_filename)
+        stitched_file = stitch_chunk_files(chunk_files, tts_filename, gap_seconds=chunk_gap)
         final_audio, srt1, srt2, srt3, srt4 = process_audio_output(stitched_file, make_subs, remove_silence, language)
-        return final_audio, f"Success! Mode: {mode}", srt1, srt2, srt3, srt4
+        status = f"Success! Mode: {mode} | Seed: {seed}"
+        return final_audio, status, srt1, srt2, srt3, srt4, seed
 
     except Exception as e:
-        return None, f"Error: {e}", None, None, None, None
+        return None, f"Error: {e}", None, None, None, None, seed if 'seed' in locals() else -1
 
 
 # --- UI Construction ---
@@ -355,10 +508,97 @@ def build_ui():
         gr.HTML("""
         <div style="text-align: center; margin: 20px auto; max-width: 800px;">
             <h1 style="font-size: 2.5em; margin-bottom: 5px;">🎙️ Qwen3-TTS </h1>
-            <a href="https://colab.research.google.com/github/NeuralFalconYT/Qwen3-TTS-Colab/blob/main/Qwen3_TTS_Colab.ipynb" target="_blank" style="display: inline-block; padding: 10px 20px; background-color: #4285F4; color: white; border-radius: 6px; text-decoration: none; font-size: 1em;">🥳 Run on Google Colab</a>
+            <a href="https://colab.research.google.com/github/shariqriazz/Qwen3-TTS-Colab/blob/main/Qwen3_TTS_Colab.ipynb" target="_blank" style="display: inline-block; padding: 10px 20px; background-color: #4285F4; color: white; border-radius: 6px; text-decoration: none; font-size: 1em;">🥳 Run on Google Colab</a>
         </div>""")
 
         with gr.Tabs():
+            # --- Tab 0: Models ---
+            with gr.Tab("Models"):
+                with gr.Accordion("📥 Download Models", open=True):
+                    gr.Markdown("*Models can be downloaded here or will auto-download when you generate in any tab.*")
+                    with gr.Row():
+                        with gr.Column(scale=1):
+                            with gr.Row():
+                                download_model_type = gr.Dropdown(
+                                    label="Type",
+                                    choices=list(AVAILABLE_MODELS.keys()),
+                                    value="CustomVoice",
+                                    interactive=True,
+                                    scale=2,
+                                )
+                                download_model_size = gr.Dropdown(
+                                    label="Size",
+                                    choices=["0.6B", "1.7B"],
+                                    value="1.7B",
+                                    interactive=True,
+                                    scale=1,
+                                )
+                            download_btn = gr.Button("Download", variant="primary", size="sm")
+                            download_status = gr.Textbox(label="Status", lines=1, interactive=False)
+                        with gr.Column(scale=2):
+                            models_status = gr.Markdown(value=get_downloaded_models_status)
+
+                download_model_type.change(
+                    get_available_sizes,
+                    inputs=[download_model_type],
+                    outputs=[download_model_size],
+                )
+
+                download_btn.click(
+                    download_model_ui,
+                    inputs=[download_model_type, download_model_size],
+                    outputs=[download_status, models_status],
+                )
+
+                with gr.Accordion("🚀 Load / Unload Models", open=False):
+                    with gr.Row():
+                        with gr.Column(scale=1):
+                            with gr.Row():
+                                load_model_type = gr.Dropdown(
+                                    label="Type",
+                                    choices=list(AVAILABLE_MODELS.keys()),
+                                    value="CustomVoice",
+                                    interactive=True,
+                                    scale=2,
+                                )
+                                load_model_size = gr.Dropdown(
+                                    label="Size",
+                                    choices=["0.6B", "1.7B"],
+                                    value="1.7B",
+                                    interactive=True,
+                                    scale=1,
+                                )
+                            with gr.Row():
+                                load_btn = gr.Button("Load to GPU", variant="primary", size="sm")
+                                unload_all_btn = gr.Button("Unload All", variant="stop", size="sm")
+                            load_status = gr.Textbox(label="Status", lines=1, interactive=False)
+                        with gr.Column(scale=2):
+                            load_refresh_btn = gr.Button("🔄 Refresh Status", size="sm")
+                            load_loaded_status = gr.Markdown(value=get_loaded_models_status)
+
+                load_model_type.change(
+                    get_available_sizes,
+                    inputs=[load_model_type],
+                    outputs=[load_model_size],
+                )
+
+                load_refresh_btn.click(
+                    lambda: get_loaded_models_status(),
+                    inputs=[],
+                    outputs=[load_loaded_status],
+                )
+
+                load_btn.click(
+                    load_model_ui,
+                    inputs=[load_model_type, load_model_size],
+                    outputs=[load_status, load_loaded_status],
+                )
+
+                unload_all_btn.click(
+                    unload_all_models_ui,
+                    inputs=[],
+                    outputs=[load_status, load_loaded_status],
+                )
             # --- Tab 1: Voice Design ---
             with gr.Tab("Voice Design"):
                 with gr.Row():
@@ -371,8 +611,15 @@ def build_ui():
                         design_btn = gr.Button("Generate with Custom Voice", variant="primary")
                         with gr.Accordion("More options", open=False):
                             with gr.Row():
-                              design_rem_silence = gr.Checkbox(label="Remove Silence", value=False)
-                              design_make_subs = gr.Checkbox(label="Generate Subtitles", value=False)
+                                design_seed = gr.Number(label="Seed (-1 = Auto)", value=-1, precision=0)
+                                design_chunk_size = gr.Slider(label="Chunk Size (chars)", minimum=50, maximum=500, value=280, step=10)
+                            with gr.Row():
+                                design_chunk_gap = gr.Slider(label="Chunk Gap (s)", minimum=0.0, maximum=3.0, value=0.0, step=0.01)
+                                design_base_size = gr.Dropdown(label="Base Model Size (for consistency)", choices=MODEL_SIZES, value="1.7B")
+                            with gr.Row():
+                                design_consistent = gr.Checkbox(label="Consistent Voice for Long Text (VoiceDesign→Base)", value=True)
+                                design_rem_silence = gr.Checkbox(label="Remove Silence", value=False)
+                                design_make_subs = gr.Checkbox(label="Generate Subtitles", value=False)
                         
                         
 
@@ -390,8 +637,8 @@ def build_ui():
 
                 design_btn.click(
                     generate_voice_design, 
-                    inputs=[design_text, design_language, design_instruct, design_rem_silence, design_make_subs], 
-                    outputs=[design_audio_out, design_status, d_srt1, d_srt2, d_srt3, d_srt4]
+                    inputs=[design_text, design_language, design_instruct, design_rem_silence, design_make_subs, design_seed, design_chunk_size, design_chunk_gap, design_consistent, design_base_size], 
+                    outputs=[design_audio_out, design_status, d_srt1, d_srt2, d_srt3, d_srt4, design_seed]
                 )
 
             # --- Tab 2: Voice Clone ---
@@ -416,8 +663,12 @@ def build_ui():
                         clone_btn = gr.Button("Clone & Generate", variant="primary")
                         with gr.Accordion("More options", open=False):
                             with gr.Row():
-                              clone_rem_silence = gr.Checkbox(label="Remove Silence", value=False)
-                              clone_make_subs = gr.Checkbox(label="Generate Subtitles", value=False)
+                                clone_seed = gr.Number(label="Seed (-1 = Auto)", value=-1, precision=0)
+                                clone_chunk_size = gr.Slider(label="Chunk Size (chars)", minimum=50, maximum=500, value=280, step=10)
+                            with gr.Row():
+                                clone_chunk_gap = gr.Slider(label="Chunk Gap (s)", minimum=0.0, maximum=3.0, value=0.0, step=0.01)
+                                clone_rem_silence = gr.Checkbox(label="Remove Silence", value=False)
+                                clone_make_subs = gr.Checkbox(label="Generate Subtitles", value=False)
 
                         
 
@@ -438,8 +689,8 @@ def build_ui():
                 
                 clone_btn.click(
                     smart_generate_clone,
-                    inputs=[clone_ref_audio, clone_ref_text, clone_target_text, clone_language, clone_mode, clone_model_size, clone_rem_silence, clone_make_subs],
-                    outputs=[clone_audio_out, clone_status, c_srt1, c_srt2, c_srt3, c_srt4]
+                    inputs=[clone_ref_audio, clone_ref_text, clone_target_text, clone_language, clone_mode, clone_model_size, clone_rem_silence, clone_make_subs, clone_seed, clone_chunk_size, clone_chunk_gap],
+                    outputs=[clone_audio_out, clone_status, c_srt1, c_srt2, c_srt3, c_srt4, clone_seed]
                 )
 
             # --- Tab 3: TTS (CustomVoice) ---
@@ -457,8 +708,12 @@ def build_ui():
                         tts_btn = gr.Button("Generate Speech", variant="primary")
                         with gr.Accordion("More options", open=False):
                             with gr.Row():
-                              tts_rem_silence = gr.Checkbox(label="Remove Silence", value=False)
-                              tts_make_subs = gr.Checkbox(label="Generate Subtitles", value=False)
+                                tts_seed = gr.Number(label="Seed (-1 = Auto)", value=-1, precision=0)
+                                tts_chunk_size = gr.Slider(label="Chunk Size (chars)", minimum=50, maximum=500, value=280, step=10)
+                            with gr.Row():
+                                tts_chunk_gap = gr.Slider(label="Chunk Gap (s)", minimum=0.0, maximum=3.0, value=0.0, step=0.01)
+                                tts_rem_silence = gr.Checkbox(label="Remove Silence", value=False)
+                                tts_make_subs = gr.Checkbox(label="Generate Subtitles", value=False)
                             
                         
 
@@ -476,8 +731,8 @@ def build_ui():
 
                 tts_btn.click(
                     generate_custom_voice, 
-                    inputs=[tts_text, tts_language, tts_speaker, tts_instruct, tts_model_size, tts_rem_silence, tts_make_subs], 
-                    outputs=[tts_audio_out, tts_status, t_srt1, t_srt2, t_srt3, t_srt4]
+                    inputs=[tts_text, tts_language, tts_speaker, tts_instruct, tts_model_size, tts_rem_silence, tts_make_subs, tts_seed, tts_chunk_size, tts_chunk_gap], 
+                    outputs=[tts_audio_out, tts_status, t_srt1, t_srt2, t_srt3, t_srt4, tts_seed]
                 )
             # --- Tab 4: About ---
             with gr.Tab("About"):

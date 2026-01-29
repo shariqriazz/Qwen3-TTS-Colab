@@ -1,5 +1,5 @@
 ## Run Qwen3 TTS on Google Colab
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/NeuralFalconYT/Qwen3-TTS-Colab/blob/main/Qwen3_TTS_Colab.ipynb) <br>
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/shariqriazz/Qwen3-TTS-Colab/blob/main/Qwen3_TTS_Colab.ipynb) <br>
 
 
 ![1](https://github.com/user-attachments/assets/e2602945-1a69-4c59-ad89-e95d96ba7858)
@@ -13,7 +13,7 @@
 ## Installation
 In short for me 
 ```
-git clone https://github.com/NeuralFalconYT/Qwen3-TTS-Colab.git
+git clone https://github.com/shariqriazz/Qwen3-TTS-Colab.git
 cd Qwen3-TTS-Colab
 python -m venv venv
 venv\Scripts\activate
@@ -47,7 +47,7 @@ python app.py
 ### 1️⃣ Clone the Repository
 
 ```bash
-git clone https://github.com/NeuralFalconYT/Qwen3-TTS-Colab.git
+git clone https://github.com/shariqriazz/Qwen3-TTS-Colab.git
 cd Qwen3-TTS-Colab
 ```
 
